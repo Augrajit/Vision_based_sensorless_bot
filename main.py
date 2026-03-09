@@ -31,20 +31,20 @@ class VideoStream:
         self.stream.release()
 # -----------------------------------------------------------------------
 
-ESP_IP = "http://172.20.10.4"           
+ESP_IP = "http://172.20.10.5"           
 ROBOT_ARUCO_ID = 0                       
 MARKER_REAL_SIZE_CM = 5.7                
 
-MAX_SPEED = 50                         
-TURN_GAIN = 2.00                          # How aggressively to turn (higher = sharper turns)
-FWD_GAIN = 3.500                           # Forward speed scaling with REAL distance (cm)
-DEADZONE_DIST_CM = 5.0                   # Now in real cm (stop if closer than this)
+MAX_SPEED = 80                         
+TURN_GAIN = 0.50                          # How aggressively to turn (higher = sharper turns)
+FWD_GAIN = 4.500                           # Forward speed scaling with REAL distance (cm)
+DEADZONE_DIST_CM = 3.0                 # Now in real cm (stop if closer than this)
 DEADZONE_ANGLE = 0.3                    # Radians (~7°) — consider "straight" if smaller
 
 # Drawing settings
 DRAW_COLOR = (0, 0, 255)                 # Red for drawn path
 DRAW_THICKNESS = 3                       # Line thickness
-LOOKAHEAD_DIST_CM = 20.0                # Shorter lookahead for better path adherence
+LOOKAHEAD_DIST_CM = 5.0                # Shorter lookahead for better path adherence
 
 # UI settings
 HEADER_HEIGHT = 60                       # Height of top control bar
@@ -56,7 +56,7 @@ aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
 aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-url = "http://172.20.10.3:8080/video" 
+url = "http://172.20.10.4:8080/video" 
 
 # --- CHANGED: Start the threaded video stream instead of standard VideoCapture ---
 print("Connecting to camera stream...")

@@ -36,7 +36,7 @@ WebServer server(80);
 #define PWM_FREQ      1000
 #define PWM_RESOLUTION 8
 
-int motorSpeed = 50;  // Max speed 0–255 (increased from 200 for full range)
+int motorSpeed = 80;  // Max speed 0–255 (increased from 200 for full range)
 
 // ===== HTML PAGE with larger joystick pad =====
 String webpage = R"====(
