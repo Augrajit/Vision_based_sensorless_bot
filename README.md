@@ -1,6 +1,6 @@
 # Vision-Based Sensorless Bot
 
-A closed-loop, camera-guided differential-drive robot that navigates **without any onboard sensors**. An overhead IP camera tracks an ArUco marker on the robot, and a Python controller sends wheel-speed commands to an ESP32 over Wi-Fi. The project was developed incrementally across five phases, from basic path drawing to full A\* obstacle avoidance with PID-stabilized control.
+A closed-loop, camera-guided differential-drive robot that navigates **without any onboard sensors**. An overhead IP camera tracks an ArUco marker on the robot, and a Python controller sends wheel-speed commands to an ESP32 over Wi-Fi. The project was developed incrementally across four phases, from basic path drawing to full A\* obstacle avoidance with PID-stabilized control.
 
 ## Features
 
@@ -23,8 +23,7 @@ A closed-loop, camera-guided differential-drive robot that navigates **without a
 ├── Update_phase1.py        # Phase 1: Click-to-place checkpoints + state machine (IDLE/DRIVING/WAITING)
 ├── Update_phase2.py        # Phase 2: Breadcrumb interpolation between checkpoints
 ├── Update_phase3.py        # Phase 3: HSV obstacle detection + danger-zone visualization
-├── Update_phase_4.py       # Phase 4: A* pathfinding + dynamic re-routing around obstacles
-├── claude.py               # Phase 5 (latest): Phase 4 + PID control + tracking memory
+├── Update_phase_4.py       # Phase 4 (latest): A* + dynamic re-routing + PID + tracking memory
 ├── code.ino                # ESP32 firmware (Wi-Fi + TB6612 motor HTTP server + web UI)
 └── README.md
 ```
@@ -37,8 +36,7 @@ A closed-loop, camera-guided differential-drive robot that navigates **without a
 | **Update_phase1.py** | Replaces freehand drawing with click-to-place checkpoints. Adds a three-state machine (`IDLE` → `DRIVING` → `WAITING`) so the robot stops for 3 seconds at each checkpoint to simulate loading/unloading. |
 | **Update_phase2.py** | Adds breadcrumb generation: when you click a new checkpoint, intermediate waypoints are auto-inserted every 20 px so the robot follows a smooth line instead of beelining between distant points. |
 | **Update_phase3.py** | Adds real-time obstacle detection using HSV color filtering (default: blue). Detected objects get a padded "Danger Zone" bounding box drawn on screen. Path planning is still manual. |
-| **Update_phase_4.py** | Replaces manual path segments with A\* grid search (20 px cells, 8-direction connectivity). Obstacles feed a padded invisible collision box into the planner. If the obstacle moves into the active path, the route is recalculated automatically after a 1.5 s cooldown. |
-| **claude.py** | **The latest and most complete version.** Builds on Phase 4 and adds: PID steering controller (Kp/Ki/Kd with anti-windup), PD forward speed controller (smooth deceleration), and short-term ArUco tracking memory (ghost position for up to 15 lost frames). |
+| **Update_phase_4.py** | **The latest and most complete version.** Includes A\* grid search (20 px cells, 8-direction connectivity), dynamic re-routing with cooldown, PID steering (Kp/Ki/Kd + anti-windup), PD forward speed control, and short-term ArUco tracking memory (ghost position for up to 15 lost frames). |
 | **code.ino** | ESP32 firmware. Connects to Wi-Fi, serves a web page with WASD keyboard and virtual joystick controls, and exposes HTTP endpoints for programmatic motor control. Uses TB6612-style dual-channel PWM. |
 
 ## Development Phases
@@ -52,11 +50,10 @@ Breadcrumbs are auto-inserted between checkpoints (every `BREADCRUMB_SPACING` px
 ### Phase 3 — Obstacle Vision
 A second processing pass converts each frame to HSV and masks for blue objects. Detected blobs above `MIN_OBSTACLE_AREA` get a padded bounding box (`DANGER_ZONE_PADDING`). The boxes are drawn on the display but do not yet affect the path.
 
-### Phase 4 — A\* Pathfinding & Dynamic Re-routing
+### Phase 4 (Final) — A\* Pathfinding, Dynamic Re-routing, PID & Tracking Memory
 Clicking a new checkpoint now triggers an A\* search from the last waypoint to the click location, routing around detected obstacle boxes (inflated by `PATH_BUFFER_PX`). While driving, the system checks every frame whether any breadcrumb has been swallowed by a moved obstacle; if so, a full re-route is computed from the robot's current position through all remaining checkpoints.
 
-### Phase 5 — PID Control & Tracking Memory
-Replaces the proportional-only steering with a full PID controller:
+This final phase also replaces proportional-only steering with a full PID controller:
 
 | Parameter | Default | Role |
 |-----------|---------|------|
@@ -157,7 +154,7 @@ python -m venv .venv
 pip install opencv-contrib-python numpy requests
 ```
 
-3. Edit configuration in your chosen script (e.g., `claude.py`):
+3. Edit configuration in your chosen script (e.g., `Update_phase_4.py`):
 
 ```python
 ESP_IP = "http://<ESP32_IP>"
@@ -171,16 +168,16 @@ MARKER_REAL_SIZE_CM = 5.7   # Measure your printed marker in cm
 To run the latest version with all features (PID + obstacle avoidance + A\*):
 
 ```powershell
-python claude.py
+python Update_phase_4.py
 ```
 
-Or run any earlier phase to test incrementally:
+Or run earlier phases to test incrementally:
 
 ```powershell
 python Update_phase1.py   # Checkpoints only
 python Update_phase2.py   # + Breadcrumbs
 python Update_phase3.py   # + Obstacle vision
-python Update_phase_4.py  # + A* pathfinding
+python Update_phase_4.py  # + A* + dynamic re-routing + PID + tracking memory (latest)
 ```
 
 ### 5. Using the UI
@@ -210,7 +207,7 @@ python Update_phase_4.py  # + A* pathfinding
 
 ## PID Tuning Guide
 
-All PID gains are defined at the top of `claude.py`. Adjust and test in short runs:
+All PID gains are defined at the top of `Update_phase_4.py`. Adjust and test in short runs:
 
 | Symptom | Fix |
 |---------|-----|
