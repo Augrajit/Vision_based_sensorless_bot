@@ -1,224 +1,331 @@
-# Vision-Based Sensorless Bot
+# Vision-Based Sensorless AMR — CCTV-Guided Differential Drive Robot
 
-A closed-loop, camera-guided differential-drive robot that navigates **without any onboard sensors**. An overhead IP camera tracks an ArUco marker on the robot, and a Python controller sends wheel-speed commands to an ESP32 over Wi-Fi. The project was developed incrementally across four phases, from basic path drawing to full A\* obstacle avoidance with PID-stabilized control.
+A closed-loop, camera-guided differential-drive robot that navigates **without any onboard sensors**. Overhead CCTV cameras track an ArUco marker on the robot; a Raspberry Pi 4 runs all navigation, obstacle detection, and pathfinding; and a Raspberry Pi Zero 2W on the robot executes PID motor control via MQTT. The project was developed across five phases, from basic path drawing through full multi-camera D\* Lite obstacle avoidance with MQTT-based fail-safe communication.
+
+---
+
+## Architecture Overview
+
+```
+[ Overhead CCTV Cameras ] ──RTSP──► [ Raspberry Pi 4 ]
+                                          │
+                               ┌──────────┼───────────────┐
+                               │          │               │
+                         ArUco Pose   MOG2 Obstacle   D* Lite
+                         Tracking     Detection       Planner
+                               │          │               │
+                               └──────────┼───────────────┘
+                                          │ MQTT (QoS 1)
+                                          ▼
+                                [ Raspberry Pi Zero 2W ] ── on robot
+                                          │
+                                    PID Motor Control
+                                          │
+                                    TB6612FNG H-Bridge
+                                       /       \
+                               Left Motor     Right Motor
+```
+
+---
 
 ## Features
 
-- **ArUco pose tracking** — real-time position and heading from a `DICT_4X4_50` marker (ID `0`)
-- **Click-to-place checkpoint navigation** — drop waypoints on the video feed; the robot visits each in order
-- **Breadcrumb interpolation** — auto-generated intermediate waypoints between checkpoints for smooth curves
-- **HSV-based obstacle detection** — blue objects detected in real time with configurable danger zones
-- **A\* pathfinding** — eight-direction grid search that routes around obstacles with safety margins
-- **Dynamic re-routing** — if an obstacle moves into the planned path, the route is recalculated on the fly
-- **PID steering & speed control** — proportional-integral-derivative controller for stable, oscillation-free driving
-- **Short-term tracking memory** — tolerates brief ArUco detection dropouts (~0.5 s) without losing control
-- **ESP32 web UI** — built-in keyboard (WASD) and virtual joystick control page for manual driving
-- **Threaded camera reader** — low-latency frame grabbing suitable for 2.4 GHz Wi-Fi links
+- **Multi-camera RTSP ingestion** — RPi 4 pulls simultaneous streams; each runs in its own thread for non-blocking frame grabs
+- **Web-based camera calibration** — Flask app served on LAN; click 4 floor reference points per camera, homography computed instantly, stored in `cameras.json`
+- **Unified floor-map construction** — each frame warped from pixel space to real-world cm coordinates; all views composited into one top-down 2D map
+- **MOG2 background subtraction** — detects any object regardless of color, shape, or type; no pre-configured HSV range required
+- **Static vs dynamic obstacle classification** — blobs stable for >N frames trigger D\* Lite reroute; moving blobs trigger stop-and-wait
+- **D\* Lite incremental pathfinding** — 20 cm grid cells, 8-direction connectivity; replans only the invalidated portion of the search graph on obstacle change (~<20 ms on RPi 4 vs ~100 ms for full A\* replan)
+- **Dynamic re-routing with cooldown** — every frame checks path against live obstacle map; recalculates from current robot position through all remaining checkpoints if blocked
+- **MQTT communication (QoS 1)** — Mosquitto broker on RPi 4; guaranteed at-least-once delivery; `{"la": 60, "ra": 55}` payload format
+- **Watchdog fail-safe** — RPi 4 publishes heartbeat every 200 ms; RPi Zero 2W stops all motors immediately if no heartbeat received within 500 ms
+- **PID steering and speed control** — full PID (Kp/Ki/Kd + anti-windup) on RPi Zero 2W; runs locally between MQTT messages
+- **Short-term ArUco tracking memory** — tolerates brief detection dropouts (~0.5 s) without losing control; gray ghost dot shown during memory-based tracking
+- **Click-to-place checkpoint navigation** — click waypoints on the unified floor map; robot visits each in order, stops for configurable dwell time
+- **Breadcrumb interpolation** — intermediate waypoints auto-generated between checkpoints for smooth trajectories
+- **Camera handoff protocol** — on stream loss, affected zone marked BLIND; robot stops if entering blind zone; overlap zones allow seamless camera switch
+
+---
 
 ## Repository Layout
 
 ```
 .
-├── main.py                 # Original prototype: freehand path drawing + pure-pursuit follower
-├── Update_phase1.py        # Phase 1: Click-to-place checkpoints + state machine (IDLE/DRIVING/WAITING)
-├── Update_phase2.py        # Phase 2: Breadcrumb interpolation between checkpoints
-├── Update_phase3.py        # Phase 3: HSV obstacle detection + danger-zone visualization
-├── Update_phase_4.py       # Phase 4 (latest): A* + dynamic re-routing + PID + tracking memory
-├── code.ino                # ESP32 firmware (Wi-Fi + TB6612 motor HTTP server + web UI)
+├── rpi4_navigation_server.py      # Central navigation: RTSP ingestion, homography, MOG2, D* Lite, MQTT publisher
+├── dstar_lite.py                  # Standalone D* Lite pathfinding class (imported by navigation server)
+├── rpizero_motor_controller.py    # On-robot: MQTT subscriber, PID control, watchdog, GPIO motor output
+├── camera_calibration_app.py      # Flask web app for per-camera homography calibration
+├── cameras.json                   # Auto-generated camera config (RTSP URLs + homography matrices)
+│
+│── Legacy Prototype (ESP32 / single-camera / A*)
+├── main.py                        # Original: freehand path drawing + pure-pursuit follower (ESP32 HTTP)
+├── Update_phase1.py               # Phase 1: Click checkpoints + IDLE/DRIVING/WAITING state machine
+├── Update_phase2.py               # Phase 2: Breadcrumb interpolation between checkpoints
+├── Update_phase3.py               # Phase 3: HSV obstacle detection + danger-zone visualization
+├── Update_phase_4.py              # Phase 4: A* pathfinding + dynamic re-routing + PID + tracking memory
+├── code.ino                       # Legacy ESP32 firmware (HTTP motor server + WASD web UI)
+│
 └── README.md
 ```
 
 ### File Descriptions
 
-| File | Purpose |
-|------|---------|
-| **main.py** | The original controller. Draw a freehand path with click-drag; the robot follows using pure-pursuit with a configurable lookahead distance. Uses proportional-only steering. |
-| **Update_phase1.py** | Replaces freehand drawing with click-to-place checkpoints. Adds a three-state machine (`IDLE` → `DRIVING` → `WAITING`) so the robot stops for 3 seconds at each checkpoint to simulate loading/unloading. |
-| **Update_phase2.py** | Adds breadcrumb generation: when you click a new checkpoint, intermediate waypoints are auto-inserted every 20 px so the robot follows a smooth line instead of beelining between distant points. |
-| **Update_phase3.py** | Adds real-time obstacle detection using HSV color filtering (default: blue). Detected objects get a padded "Danger Zone" bounding box drawn on screen. Path planning is still manual. |
-| **Update_phase_4.py** | **The latest and most complete version.** Includes A\* grid search (20 px cells, 8-direction connectivity), dynamic re-routing with cooldown, PID steering (Kp/Ki/Kd + anti-windup), PD forward speed control, and short-term ArUco tracking memory (ghost position for up to 15 lost frames). |
-| **code.ino** | ESP32 firmware. Connects to Wi-Fi, serves a web page with WASD keyboard and virtual joystick controls, and exposes HTTP endpoints for programmatic motor control. Uses TB6612-style dual-channel PWM. |
+| File | Platform | Purpose |
+|------|----------|---------|
+| **rpi4_navigation_server.py** | Raspberry Pi 4 | Production controller. Multi-camera RTSP ingestion, homography stitching, MOG2 obstacle detection, D\* Lite planning, MQTT publish, ArUco tracking with memory, watchdog heartbeat |
+| **dstar_lite.py** | Raspberry Pi 4 | Standalone D\* Lite pathfinding class with `calculate_key()`, `initialize()`, `update_vertex()`, `compute_shortest_path()`, `move_and_replan()`, `is_obstacle()` — imported by navigation server, testable independently |
+| **rpizero_motor_controller.py** | Raspberry Pi Zero 2W | On-robot. Subscribes to MQTT motor commands, runs PID loop locally, watchdog consumer (stops if heartbeat lost), GPIO → TB6612FNG PWM output |
+| **camera_calibration_app.py** | Any browser (served by RPi 4) | Flask web app; shows live RTSP stream, accepts 4 reference point clicks, computes `cv2.getPerspectiveTransform()`, saves result to `cameras.json` |
+| **main.py** | PC (legacy) | Original single-camera prototype; freehand path drawing, pure-pursuit follower, ESP32 HTTP control |
+| **Update_phase1.py** | PC (legacy) | Click-to-place checkpoints; three-state machine; ESP32 HTTP |
+| **Update_phase2.py** | PC (legacy) | Adds breadcrumb generation between checkpoints |
+| **Update_phase3.py** | PC (legacy) | Adds HSV-based blue obstacle detection and danger-zone visualization |
+| **Update_phase_4.py** | PC (legacy) | A\* pathfinding, dynamic re-routing, full PID, ArUco tracking memory; ESP32 HTTP |
+| **code.ino** | ESP32 (legacy) | TB6612FNG H-bridge motor server; WASD + joystick web UI; HTTP `/set?la=X&ra=Y` endpoint |
+
+---
 
 ## Development Phases
 
-### Phase 1 — Checkpoint State Machine
-Click to place waypoints. The robot drives to each one, stops for 3 seconds (simulating a logistics pickup/drop), then proceeds to the next. Proportional steering only.
+### Prototype Phase (Legacy — PC + ESP32 + Single Camera)
 
-### Phase 2 — Breadcrumb Interpolation
-Breadcrumbs are auto-inserted between checkpoints (every `BREADCRUMB_SPACING` px). The robot drives through breadcrumbs without stopping but pauses at real checkpoints. This produces smoother trajectories.
+#### Phase 0 — Freehand Path Follower (`main.py`)
+Click-drag to draw a path; robot follows using pure-pursuit with a configurable lookahead distance. Proportional-only steering. ESP32 controlled via HTTP GET.
 
-### Phase 3 — Obstacle Vision
-A second processing pass converts each frame to HSV and masks for blue objects. Detected blobs above `MIN_OBSTACLE_AREA` get a padded bounding box (`DANGER_ZONE_PADDING`). The boxes are drawn on the display but do not yet affect the path.
+#### Phase 1 — Checkpoint State Machine (`Update_phase1.py`)
+Click to place waypoints. Robot drives to each, stops for 3 seconds (simulating logistics pickup/drop), then proceeds. Proportional steering only.
 
-### Phase 4 (Final) — A\* Pathfinding, Dynamic Re-routing, PID & Tracking Memory
-Clicking a new checkpoint now triggers an A\* search from the last waypoint to the click location, routing around detected obstacle boxes (inflated by `PATH_BUFFER_PX`). While driving, the system checks every frame whether any breadcrumb has been swallowed by a moved obstacle; if so, a full re-route is computed from the robot's current position through all remaining checkpoints.
+#### Phase 2 — Breadcrumb Interpolation (`Update_phase2.py`)
+Breadcrumbs auto-inserted between checkpoints every `BREADCRUMB_SPACING` px. Robot drives through breadcrumbs without stopping, pauses only at real checkpoints. Produces smoother trajectories.
 
-This final phase also replaces proportional-only steering with a full PID controller:
+#### Phase 3 — Obstacle Vision (`Update_phase3.py`)
+HSV color filtering detects blue objects. Detected blobs get a padded "Danger Zone" bounding box. Boxes drawn on display but do not yet affect the path.
 
-| Parameter | Default | Role |
-|-----------|---------|------|
-| `STEER_KP` | 2.00 | Proportional: corrects current heading error |
-| `STEER_KI` | 0.05 | Integral: eliminates persistent drift over time |
-| `STEER_KD` | 0.80 | Derivative: dampens oscillation |
-| `STEER_INTEGRAL_LIMIT` | 2.0 | Anti-windup cap on the integral accumulator |
-| `SPEED_KP` | 4.50 | Distance-proportional forward speed |
-| `SPEED_KD` | 1.00 | Smooth deceleration as target approaches |
+#### Phase 4 — A\* + Dynamic Re-routing + PID + Tracking Memory (`Update_phase_4.py`)
+New checkpoints trigger A\* search from last waypoint, routing around detected obstacles. Every frame checks if any breadcrumb is inside a moved obstacle box; if so, full reroute from robot's current position. Full PID controller replaces proportional-only steering. Short-term ArUco memory for occlusion tolerance.
 
-Short-term memory keeps the last-known position and heading for up to `MAX_LOST_FRAMES` (15) frames when the ArUco marker is temporarily occluded. A gray "ghost" dot indicates memory-based tracking.
+---
+
+### Production System (RPi 4 + RPi Zero 2W + Multi-Camera)
+
+#### Block A — Perceive
+Multi-camera RTSP ingestion → per-camera homography → unified top-down floor map → MOG2 background subtraction → static/dynamic obstacle classification.
+
+#### Block B — Decide
+Supervisor clicks waypoints on the unified 2D floor map via web UI. D\* Lite incrementally replans around obstacles. Dynamic re-routing every frame with 1.5 s cooldown. Checkpoint arrival triggers 3 s dwell.
+
+#### Block C — Act
+MQTT QoS 1 commands from RPi 4 to RPi Zero 2W. PID motor loop runs locally on RPi Zero 2W. Watchdog: if no heartbeat in 500 ms → immediate motor stop.
+
+---
 
 ## Hardware Requirements
 
-- ESP32 development board
+### Production System
+- Raspberry Pi 4 (4 GB recommended) — navigation server
+- Raspberry Pi Zero 2W — on-robot motor controller
+- TB6612FNG dual H-bridge motor driver (connected to RPi Zero 2W GPIO)
 - 2× DC gear motors (differential drive)
-- TB6612FNG (or equivalent) dual H-bridge motor driver
-- Android phone running an IP camera app (e.g., IP Webcam)
-- Battery supply for motors + stable 5 V for ESP32
+- Existing facility CCTV cameras with RTSP output (or any IP camera)
 - Printed ArUco marker (`DICT_4X4_50`, ID `0`) mounted on robot top
+- Battery supply for motors + stable 5 V for RPi Zero 2W
+- Local Wi-Fi network (2.4 GHz, stable signal)
 
-## ESP32 Pin Mapping
+### Legacy Prototype (for reference)
+- ESP32 development board
+- TB6612FNG motor driver
+- Android phone running IP Webcam app
 
-Defined in `code.ino`:
+---
 
-| Function | GPIO |
-|----------|------|
-| PWMA (left motor speed) | 25 |
-| AIN1 (left motor dir) | 16 |
-| AIN2 (left motor dir) | 21 |
-| PWMB (right motor speed) | 22 |
-| BIN1 (right motor dir) | 26 |
-| BIN2 (right motor dir) | 27 |
-| STBY (driver enable) | 13 |
+## RPi Zero 2W GPIO Pin Mapping
 
-Update these constants before uploading if your wiring differs.
+Defined in `rpizero_motor_controller.py`:
+
+| Function | GPIO (BCM) |
+|----------|-----------|
+| PWMA (left motor speed) | 12 |
+| AIN1 (left direction) | 23 |
+| AIN2 (left direction) | 24 |
+| PWMB (right motor speed) | 13 |
+| BIN1 (right direction) | 27 |
+| BIN2 (right direction) | 22 |
+| STBY (driver enable) | 25 |
+
+Update these constants before deploying if your wiring differs.
+
+---
 
 ## Software Requirements
 
-### PC / Laptop
+### Raspberry Pi 4 (Navigation Server)
 
-- Python 3.9+
-- `opencv-contrib-python`
-- `numpy`
-- `requests`
-
-### ESP32 Build Environment
-
-- Arduino IDE 2.x (or PlatformIO)
-- ESP32 board package installed
-- `WiFi.h` and `WebServer.h` (bundled with ESP32 core)
-
-## Network Requirements
-
-- Phone, ESP32, and computer must be on the **same local network**
-- Prefer stable 2.4 GHz Wi-Fi with good signal strength
-- Reserve static DHCP leases for ESP32 and phone to avoid IP changes between sessions
-
-## Deploy Step-by-Step
-
-### 1. Flash ESP32 Firmware
-
-1. Open `code.ino` in Arduino IDE.
-2. Set your Wi-Fi credentials:
-
-```cpp
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+```bash
+pip install opencv-contrib-python numpy paho-mqtt flask
+# Mosquitto MQTT broker
+sudo apt install mosquitto mosquitto-clients
+sudo systemctl enable mosquitto
 ```
 
-3. Select your ESP32 board and COM port.
-4. Upload firmware.
-5. Open Serial Monitor (`115200`) and note the printed ESP32 IP address.
+### Raspberry Pi Zero 2W (Motor Controller)
 
-### 2. Start Phone Camera Stream
-
-1. Install and open IP Webcam (or equivalent).
-2. Set resolution to `640×480` for lower latency.
-3. Start server and note phone IP.
-4. Confirm stream URL works in browser:
-
-```
-http://<PHONE_IP>:8080/video
+```bash
+pip install paho-mqtt RPi.GPIO
 ```
 
-### 3. Configure Python Controller
+### PC (Legacy Prototype Only)
 
-1. Create and activate a virtual environment:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-2. Install dependencies:
-
-```powershell
+```bash
 pip install opencv-contrib-python numpy requests
 ```
 
-3. Edit configuration in your chosen script (e.g., `Update_phase_4.py`):
+---
+
+## Network Requirements
+
+- RPi 4, RPi Zero 2W, and CCTV cameras must be on the same local network
+- Prefer stable 2.4 GHz Wi-Fi with good signal strength
+- Reserve static DHCP leases for all devices to avoid IP changes between sessions
+- Mosquitto broker on RPi 4 must be reachable from RPi Zero 2W (default port 1883)
+
+---
+
+## Deploy Step-by-Step (Production System)
+
+### 1. Configure and Start Mosquitto (RPi 4)
+
+```bash
+# /etc/mosquitto/mosquitto.conf
+listener 1883
+allow_anonymous true
+```
+
+```bash
+sudo systemctl restart mosquitto
+```
+
+### 2. Calibrate Cameras (One-Time Setup)
+
+```bash
+# On RPi 4
+python camera_calibration_app.py
+```
+
+Open `http://<RPI4_IP>:5000` in any browser. For each camera:
+1. Enter RTSP URL (e.g., `rtsp://192.168.1.X/stream`)
+2. Use a tape measure to mark 4 real-world reference points on the floor (note their cm coordinates)
+3. Click the 4 points on the live video feed in matching order
+4. Click "Compute Homography" — matrix saved to `cameras.json`
+
+Repeat for every camera. This is a one-time setup per session (or whenever a camera is moved).
+
+### 3. Configure Navigation Server
+
+Edit constants at the top of `rpi4_navigation_server.py`:
 
 ```python
-ESP_IP = "http://<ESP32_IP>"
-url = "http://<PHONE_IP>:8080/video"
+MQTT_BROKER_IP = "localhost"          # Mosquitto is local to RPi 4
 ROBOT_ARUCO_ID = 0
-MARKER_REAL_SIZE_CM = 5.7   # Measure your printed marker in cm
+MARKER_REAL_SIZE_CM = 5.7             # Measure your printed marker
+CAMERAS_CONFIG = "cameras.json"       # Output from calibration step
 ```
 
-### 4. Run the System
+### 4. Configure Motor Controller (RPi Zero 2W)
 
-To run the latest version with all features (PID + obstacle avoidance + A\*):
+Edit constants at the top of `rpizero_motor_controller.py`:
 
-```powershell
-python Update_phase_4.py
+```python
+MQTT_BROKER_IP = "192.168.X.X"       # RPi 4 IP address
+HEARTBEAT_TIMEOUT_MS = 500            # Stop motors if no heartbeat within this window
 ```
 
-Or run earlier phases to test incrementally:
+### 5. Start Motor Controller First (RPi Zero 2W)
 
-```powershell
-python Update_phase1.py   # Checkpoints only
-python Update_phase2.py   # + Breadcrumbs
-python Update_phase3.py   # + Obstacle vision
-python Update_phase_4.py  # + A* + dynamic re-routing + PID + tracking memory (latest)
+```bash
+python rpizero_motor_controller.py
 ```
 
-### 5. Using the UI
+The motor controller subscribes to MQTT and waits. It will stop immediately if the heartbeat topic goes quiet.
 
-- **Click** on the video feed (below the header bar) to place checkpoints
-- **Follow** button — starts the robot driving through the planned route
+### 6. Start Navigation Server (RPi 4)
+
+```bash
+python rpi4_navigation_server.py
+```
+
+Opens an OpenCV window showing the unified floor map. The server also begins publishing heartbeats.
+
+### 7. Using the UI
+
+- **Click** on the floor map to place checkpoints (D\* Lite routes around live obstacles automatically)
+- **Follow** button — starts the robot driving the planned route
 - **Clear** button — stops the robot and erases all waypoints
-- **ESC** — safe shutdown (motors stop, camera releases)
+- **ESC** — safe shutdown (motors stop, MQTT disconnect, camera release)
 
-## Quick Validation Checklist
+---
 
-- [ ] Opening `http://<ESP32_IP>/` shows the WASD + joystick control page
-- [ ] Calling `http://<ESP32_IP>/set?la=30&ra=30` moves the robot forward
-- [ ] Camera stream URL opens and updates live in a browser
-- [ ] ArUco marker is detected and a green dot appears on the robot in the UI
+## MQTT Topics
 
-## Runtime API (ESP32)
+| Topic | Publisher | Payload | Description |
+|-------|-----------|---------|-------------|
+| `factory/robot/01/cmd` | RPi 4 | `{"la": int, "ra": int}` | Signed wheel speeds (−255 to 255) |
+| `factory/robot/01/heartbeat` | RPi 4 | `"alive"` | Published every 200 ms; loss triggers motor stop |
+| `factory/robot/01/status` | RPi Zero 2W | `{"state": str}` | `"moving"` / `"stopped"` / `"watchdog_stop"` |
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /set?la=<int>&ra=<int>` | Set signed wheel speeds (−255 to 255) |
-| `GET /F` | Forward at default speed |
-| `GET /B` | Backward at default speed |
-| `GET /L` | Spin left |
-| `GET /R` | Spin right |
-| `GET /S` | Stop both motors |
+---
 
-## PID Tuning Guide
+## PID Tuning Guide (Production System)
 
-All PID gains are defined at the top of `Update_phase_4.py`. Adjust and test in short runs:
+All PID gains are defined at the top of `rpi4_navigation_server.py`:
 
 | Symptom | Fix |
 |---------|-----|
-| Robot wobbles/oscillates side to side | Increase `STEER_KD` (e.g., 1.0–1.5) or decrease `STEER_KP` |
+| Robot wobbles / oscillates side to side | Increase `STEER_KD` (try 1.0–1.5) or decrease `STEER_KP` |
 | Robot turns too slowly | Increase `STEER_KP` |
-| Robot drifts consistently to one side | Increase `STEER_KI` slightly (e.g., 0.08–0.15) |
+| Robot drifts consistently to one side | Increase `STEER_KI` slightly (try 0.08–0.15) |
 | Robot overshoots and stops too late | Increase `SPEED_KD` |
 | Robot moves too fast near targets | Decrease `SPEED_KP` |
-| Robot stalls during point turns | Increase the minimum `turn` floor (currently 35) |
+| Robot stalls during point turns | Raise the minimum turn floor (currently 35 PWM counts) |
 
-Other key parameters:
+| Parameter | Default | Role |
+|-----------|---------|------|
+| `STEER_KP` | 3.00 | Proportional: corrects current heading error |
+| `STEER_KI` | 0.05 | Integral: eliminates persistent drift |
+| `STEER_KD` | 0.80 | Derivative: dampens oscillation |
+| `STEER_INTEGRAL_LIMIT` | 2.0 | Anti-windup cap on integral accumulator |
+| `SPEED_KP` | 4.50 | Distance-proportional forward speed |
+| `SPEED_KD` | 1.00 | Smooth deceleration as target approaches |
+
+---
+
+## D\* Lite vs A\* — Why It Matters
+
+| Property | A\* (Phase 4 legacy) | D\* Lite (production) |
+|----------|----------------------|----------------------|
+| Replan strategy | Full replan from scratch | Propagates only invalidated portion |
+| Replan time (large floor) | ~100 ms | ~20 ms |
+| Suitable for moving obstacles | No — too slow | Yes |
+| Implementation complexity | Low | Moderate |
+
+In a factory with moving humans and forklifts, the difference between 20 ms and 100 ms replanning is operationally significant — it determines whether the robot reacts before or after collision.
+
+---
+
+## MOG2 vs HSV Color Filtering — Why It Matters
+
+| Property | HSV filtering (Phase 3 legacy) | MOG2 (production) |
+|----------|-------------------------------|-------------------|
+| Detects | Only the configured color range | Any object on the floor |
+| Requires tuning | Yes — per object color | No — learns background at startup |
+| Handles lighting changes | Poorly | Yes — adaptive model |
+| False positives from floor markings | Common | Rare (floor is background) |
+| Detects cardboard box, pallet, human | Only if color matches | Yes |
+
+MOG2 requires a 30–50 frame background initialization at startup (empty floor). All subsequent frames are compared against this model.
+
+---
+
+## Key Configuration Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -226,32 +333,89 @@ Other key parameters:
 | `DEADZONE_DIST_CM` | 3.0 | Distance threshold to consider a waypoint reached |
 | `DEADZONE_ANGLE` | 0.3 rad | Angle threshold below which steering correction is skipped |
 | `POINT_TURN_ANGLE` | 0.6 rad | Above this error, robot stops forward motion and spins in place |
-| `DANGER_ZONE_PADDING` | 60 px | How far the safety box extends beyond the detected obstacle edge |
-| `PATH_BUFFER_PX` | 65 px | Extra invisible margin fed to A\* to keep the path away from obstacles |
-| `RECALC_COOLDOWN` | 1.5 s | Minimum time between dynamic re-route calculations |
+| `DANGER_ZONE_PADDING_CM` | 12 cm | Safety box extends this far beyond detected obstacle edge |
+| `PATH_BUFFER_CM` | 13 cm | Extra invisible margin fed to D\* Lite to keep path away from obstacles |
+| `RECALC_COOLDOWN` | 1.5 s | Minimum time between dynamic re-route calculations (absorbs camera jitter) |
+| `MAX_LOST_FRAMES` | 15 | ArUco tracking memory: tolerate this many lost frames before giving up |
+| `HEARTBEAT_INTERVAL_MS` | 200 | RPi 4 publishes heartbeat at this interval |
+| `HEARTBEAT_TIMEOUT_MS` | 500 | RPi Zero 2W stops motors if no heartbeat within this window |
+| `GRID_SIZE_CM` | 20 | D\* Lite grid cell size in cm |
+| `STOP_DURATION` | 3.0 s | Robot dwell time at each checkpoint (simulated load/unload) |
+| `BREADCRUMB_SPACING_CM` | 15 cm | Intermediate waypoint interval between checkpoints |
+| `MOG2_HISTORY` | 50 | Background model frames (empty-floor capture at startup) |
+| `MOG2_VAR_THRESHOLD` | 40 | Sensitivity of foreground detection |
+
+---
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| High video delay | Lower camera resolution/FPS; keep phone close to router |
-| Robot not moving | Verify `/set` endpoint in a browser; check motor wiring and `STBY` pin |
+| Robot doesn't move | Check MQTT connection; verify `heartbeat` topic is publishing; inspect GPIO wiring |
+| Watchdog fires immediately | RPi 4 heartbeat not publishing; check Mosquitto broker is running |
+| High video delay | Lower camera resolution/FPS; ensure cameras are on 5 GHz if available |
 | Marker not detected | Improve lighting; print marker with sharp black-on-white edges |
-| Wrong turning direction | Swap motor polarity or left/right channel mapping in `setMotors()` |
-| Intermittent control | Use stronger Wi-Fi; avoid crowded hotspot channels |
-| A\* finds no path | Reduce `DANGER_ZONE_PADDING` / `PATH_BUFFER_PX` if obstacles are close together |
-| Robot panics near obstacles | Increase `RECALC_COOLDOWN` or the jitter immunity radius (currently 60 px) |
+| MOG2 flags entire floor | Background model captured with robot already on floor; restart with empty floor |
+| D\* Lite finds no path | Reduce `DANGER_ZONE_PADDING_CM` / `PATH_BUFFER_CM` if obstacles are tightly packed |
+| Camera calibration drift | Re-run `camera_calibration_app.py`; check that reference points are not moved |
+| Wrong turning direction | Swap `AIN1`/`AIN2` or `BIN1`/`BIN2` pin assignments in `rpizero_motor_controller.py` |
+| Robot oscillates at speed | Decrease `STEER_KP`; increase `STEER_KD` |
+| Robot drifts on straight runs | Increase `STEER_KI` gradually |
+
+---
+
+## Quick Validation Checklist
+
+- [ ] Mosquitto broker running on RPi 4: `mosquitto_sub -t factory/robot/01/heartbeat` shows `"alive"` every 200 ms
+- [ ] RPi Zero 2W subscribed and motors respond: publish `{"la": 40, "ra": 40}` to `factory/robot/01/cmd`
+- [ ] Camera RTSP streams open in VLC before starting the server
+- [ ] Background model initialized with empty floor (no robot, no obstacles)
+- [ ] ArUco marker detected — green dot appears on robot in the UI
+- [ ] Placing a checkpoint routes around visible obstacles automatically
+
+---
 
 ## Safety Notes
 
+- Always start `rpizero_motor_controller.py` **before** `rpi4_navigation_server.py` so the watchdog is armed before any commands are sent
 - Test on a stand first (wheels off ground) before deploying on the floor
-- Keep an emergency stop method ready (power switch or unplug battery)
+- Keep an emergency stop ready (cut motor battery or publish `{"la": 0, "ra": 0}` to the cmd topic)
 - Do not run near edges, stairs, or fragile objects
+- The watchdog only covers network/software faults — it does not replace a physical emergency stop for high-speed or heavy-load deployments
+
+---
+
+## Runtime API (MQTT)
+
+```bash
+# Move forward
+mosquitto_pub -h <RPI4_IP> -t factory/robot/01/cmd -m '{"la": 50, "ra": 50}'
+
+# Stop
+mosquitto_pub -h <RPI4_IP> -t factory/robot/01/cmd -m '{"la": 0, "ra": 0}'
+
+# Monitor heartbeat
+mosquitto_sub -h <RPI4_IP> -t factory/robot/01/heartbeat
+
+# Monitor robot status
+mosquitto_sub -h <RPI4_IP> -t factory/robot/01/status
+```
+
+---
+
+## References
+
+**[1]** Koenig, S., & Likhachev, M. (2002). D\* Lite. *Proceedings of the 18th National Conference on Artificial Intelligence (AAAI '02)*, pp. 476–483.
+
+**[2]** Garrido-Jurado, S. et al. (2014). Automatic generation and detection of highly reliable fiducial markers under occlusion. *Pattern Recognition*, 47(6), 2280–2292.
+
+**[3]** Zivkovic, Z. (2004). Improved adaptive Gaussian mixture model for background subtraction. *ICPR 2004*.
+
+**[4]** World Bank. (2021). *Gearing Up for the Future of Manufacturing in Bangladesh*. World Bank Group.
+
+---
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0**. See the license header in `code.ino` for details.
+This project is licensed under the **GNU General Public License v3.0**.
 
-## Credits
-
-Created by **Vikas Singh Thakur**. This version adds threaded camera streaming, A\* obstacle avoidance, PID control, and deployment-oriented tuning for constrained 2.4 GHz setups.
